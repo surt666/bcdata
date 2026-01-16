@@ -5,6 +5,8 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as cr from "aws-cdk-lib/custom-resources";
 import * as lakeformation from "aws-cdk-lib/aws-lakeformation";
+import * as glue from "aws-cdk-lib/aws-glue";
+import * as s3 from "aws-cdk-lib/aws-s3";
 // import * as sqs from 'aws-cdk-lib/aws-sqs';
 
 export class BcdataStack extends cdk.Stack {
@@ -12,6 +14,14 @@ export class BcdataStack extends cdk.Stack {
     super(scope, id, props);
 
     const tableBucket = "billing2";
+
+    // S3 bucket for Athena query results
+    const athenaResultsBucket = new s3.Bucket(this, "AthenaResultsBucket", {
+      bucketName: `${tableBucket}-athena-results`,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
+    });
+
     const s3TableBucket = new s3tables.CfnTableBucket(
       this,
       "BillingTableBucket",
@@ -169,28 +179,29 @@ def handler(event, context):
         if request_type in ['Create', 'Update']:
             query_execution_ids = []
 
-            # Add partition fields
+            # Add partition fields using resource link
+            resource_link_db = f"{namespace}_link"
             for field in partition_fields:
-                query = f"ALTER TABLE \\"{namespace}\\".\\"{table_name}\\" ADD PARTITION FIELD {field}"
+                query = f"ALTER TABLE {resource_link_db}.{table_name} ADD PARTITION FIELD {field}"
                 print(f"Executing: {query}")
 
                 response = athena.start_query_execution(
                     QueryString=query,
                     ResultConfiguration={'OutputLocation': output_location},
-                    QueryExecutionContext={'Catalog': 's3tables'}
+                    QueryExecutionContext={'Database': resource_link_db}
                 )
                 query_execution_ids.append(response['QueryExecutionId'])
 
             # Set sort order
             if sort_fields:
                 sort_clause = ', '.join(sort_fields)
-                query = f"ALTER TABLE \\"{namespace}\\".\\"{table_name}\\" WRITE ORDERED BY {sort_clause}"
+                query = f"ALTER TABLE {resource_link_db}.{table_name} WRITE ORDERED BY {sort_clause}"
                 print(f"Executing: {query}")
 
                 response = athena.start_query_execution(
                     QueryString=query,
                     ResultConfiguration={'OutputLocation': output_location},
-                    QueryExecutionContext={'Catalog': 's3tables'}
+                    QueryExecutionContext={'Database': resource_link_db}
                 )
                 query_execution_ids.append(response['QueryExecutionId'])
 
@@ -249,10 +260,14 @@ def handler(event, context):
           "s3:PutObject",
           "s3:GetObject",
           "s3:ListBucket",
+          "s3:GetBucketLocation",
+          "s3:ListBucketMultipartUploads",
+          "s3:ListMultipartUploadParts",
+          "s3:AbortMultipartUpload",
         ],
         resources: [
-          `arn:aws:s3:::${tableBucket}-athena-results`,
-          `arn:aws:s3:::${tableBucket}-athena-results/*`,
+          athenaResultsBucket.bucketArn,
+          `${athenaResultsBucket.bucketArn}/*`,
         ],
       })
     );
@@ -275,44 +290,96 @@ def handler(event, context):
       })
     );
 
-    // Grant Lake Formation permissions on the database
-    new lakeformation.CfnPrincipalPermissions(
-      this,
-      "LambdaDatabasePermissions",
-      {
-        permissions: ["DESCRIBE"],
-        permissionsWithGrantOption: [],
-        principal: {
-          dataLakePrincipalIdentifier: configureTableFn.role!.roleArn,
+    // Create Glue resource link for S3 Tables
+    const resourceLink = new glue.CfnDatabase(this, "S3TablesResourceLink", {
+      catalogId: cdk.Aws.ACCOUNT_ID,
+      databaseInput: {
+        name: `${namespace.namespace}_link`,
+        targetDatabase: {
+          catalogId: `${cdk.Aws.ACCOUNT_ID}:s3tablescatalog/${tableBucket}`,
+          databaseName: namespace.namespace,
         },
-        resource: {
-          database: {
-            catalogId: "s3tablescatalog",
-            name: namespace.namespace,
-          },
-        },
-      }
-    );
+      },
+    });
+    resourceLink.node.addDependency(namespace);
 
-    // Grant Lake Formation permissions on the table
-    new lakeformation.CfnPrincipalPermissions(
+    // Grant Lake Formation permissions on the resource link database
+    const lambdaResourceLinkDbPermissions = new lakeformation.CfnPermissions(
       this,
-      "LambdaTablePermissions",
+      "LambdaResourceLinkDbPermissions",
       {
-        permissions: ["SELECT", "DESCRIBE", "ALTER"],
-        permissionsWithGrantOption: [],
-        principal: {
+        dataLakePrincipal: {
           dataLakePrincipalIdentifier: configureTableFn.role!.roleArn,
         },
         resource: {
-          table: {
-            catalogId: "s3tablescatalog",
-            databaseName: namespace.namespace,
-            name: metersTable.tableName,
+          databaseResource: {
+            name: `${namespace.namespace}_link`,
+            catalogId: cdk.Aws.ACCOUNT_ID,
           },
         },
+        permissions: ["ALL"],
       }
     );
+    lambdaResourceLinkDbPermissions.node.addDependency(resourceLink);
+
+    // Grant Lake Formation permissions on resource link tables
+    const lambdaResourceLinkTablePermissions = new lakeformation.CfnPermissions(
+      this,
+      "LambdaResourceLinkTablePermissions",
+      {
+        dataLakePrincipal: {
+          dataLakePrincipalIdentifier: configureTableFn.role!.roleArn,
+        },
+        resource: {
+          tableResource: {
+            databaseName: `${namespace.namespace}_link`,
+            catalogId: cdk.Aws.ACCOUNT_ID,
+            tableWildcard: {},
+          },
+        },
+        permissions: ["SELECT", "INSERT", "DELETE", "DESCRIBE", "ALTER"],
+      }
+    );
+    lambdaResourceLinkTablePermissions.node.addDependency(resourceLink);
+
+    // Grant Lake Formation permissions on actual S3 Tables database
+    const lambdaS3TablesDbPermissions = new lakeformation.CfnPermissions(
+      this,
+      "LambdaS3TablesDbPermissions",
+      {
+        dataLakePrincipal: {
+          dataLakePrincipalIdentifier: configureTableFn.role!.roleArn,
+        },
+        resource: {
+          databaseResource: {
+            name: namespace.namespace,
+            catalogId: `${cdk.Aws.ACCOUNT_ID}:s3tablescatalog/${tableBucket}`,
+          },
+        },
+        permissions: ["ALL"],
+      }
+    );
+    lambdaS3TablesDbPermissions.node.addDependency(namespace);
+
+    // Grant Lake Formation permissions on actual S3 Tables
+    const lambdaS3TablesTablePermissions = new lakeformation.CfnPermissions(
+      this,
+      "LambdaS3TablesTablePermissions",
+      {
+        dataLakePrincipal: {
+          dataLakePrincipalIdentifier: configureTableFn.role!.roleArn,
+        },
+        resource: {
+          tableResource: {
+            databaseName: namespace.namespace,
+            catalogId: `${cdk.Aws.ACCOUNT_ID}:s3tablescatalog/${tableBucket}`,
+            tableWildcard: {},
+          },
+        },
+        permissions: ["SELECT", "INSERT", "DELETE", "DESCRIBE", "ALTER"],
+      }
+    );
+    lambdaS3TablesTablePermissions.node.addDependency(metersTable);
 
     // Create custom resource provider
     const provider = new cr.Provider(this, "ConfigureTableProvider", {
@@ -332,11 +399,14 @@ def handler(event, context):
           PartitionFields: ["company_id"],
           SortFields: ["company_id", "building_id"],
           OutputLocation: `s3://${tableBucket}-athena-results/`,
+          // Force update by changing this version when needed
+          Version: "4",
         },
       }
     );
 
     configureTableResource.node.addDependency(metersTable);
+    configureTableResource.node.addDependency(athenaResultsBucket);
 
     // Table bucket policy to control access
     new s3tables.CfnTableBucketPolicy(this, "BillingTableBucketPolicy", {
