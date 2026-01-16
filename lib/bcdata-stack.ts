@@ -13,7 +13,7 @@ export class BcdataStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    const tableBucket = "billing2";
+    const tableBucket = "billing";
 
     // S3 bucket for Athena query results
     const athenaResultsBucket = new s3.Bucket(this, "AthenaResultsBucket", {
@@ -44,117 +44,117 @@ export class BcdataStack extends cdk.Stack {
     });
     namespace.addDependency(s3TableBucket);
 
-    const metersTable = new s3tables.CfnTable(this, "meterstable", {
-      namespace: namespace.namespace,
-      openTableFormat: "ICEBERG",
-      tableBucketArn: s3TableBucket.attrTableBucketArn,
-      tableName: "meters",
+    // const metersTable = new s3tables.CfnTable(this, "meterstable", {
+    //   namespace: namespace.namespace,
+    //   openTableFormat: "ICEBERG",
+    //   tableBucketArn: s3TableBucket.attrTableBucketArn,
+    //   tableName: "meters",
 
-      // the properties below are optional
-      compaction: {
-        status: "enabled",
-        targetFileSizeMb: 256,
-      },
-      icebergMetadata: {
-        icebergSchema: {
-          schemaFieldList: [
-            {
-              name: "timestamp",
-              type: "timestamp",
-              required: true,
-            },
-            {
-              name: "company_id",
-              type: "int",
-              required: true,
-            },
-            {
-              name: "property_id",
-              type: "int",
-            },
-            {
-              name: "building_id",
-              type: "int",
-              required: true,
-            },
-            {
-              name: "company_name",
-              type: "string",
-              required: true,
-            },
-            {
-              name: "building_name",
-              type: "string",
-              required: true,
-            },
-            {
-              name: "total",
-              type: "int",
-              required: true,
-            },
-            {
-              name: "actively_remote_read",
-              type: "int",
-            },
-            {
-              name: "active_manual_read",
-              type: "int",
-            },
-            {
-              name: "active_calculation_meters",
-              type: "int",
-            },
-            {
-              name: "inactive_remotely_read",
-              type: "int",
-            },
-            {
-              name: "inactive_manually_read",
-              type: "int",
-            },
-            {
-              name: "inactive_calculation_meters",
-              type: "int",
-            },
-            {
-              name: "unsupported_remotely_read",
-              type: "int",
-            },
-            {
-              name: "unsupported_manually_read",
-              type: "int",
-            },
-            {
-              name: "unsupported_calculation_meters",
-              type: "int",
-            },
-            {
-              name: "active_management_read",
-              type: "int",
-            },
-            {
-              name: "active_garbage_meter_read",
-              type: "int",
-            },
-          ],
-        },
-      },
-      snapshotManagement: {
-        maxSnapshotAgeHours: 24,
-        minSnapshotsToKeep: 3,
-        status: "enabled",
-      },
-      storageClassConfiguration: {
-        storageClass: "STANDARD",
-      },
-      tags: [
-        {
-          key: "Name",
-          value: "MetersTable",
-        },
-      ],
-    });
-    metersTable.addDependency(namespace);
+    //   // the properties below are optional
+    //   compaction: {
+    //     status: "enabled",
+    //     targetFileSizeMb: 256,
+    //   },
+    //   icebergMetadata: {
+    //     icebergSchema: {
+    //       schemaFieldList: [
+    //         {
+    //           name: "timestamp",
+    //           type: "timestamp",
+    //           required: true,
+    //         },
+    //         {
+    //           name: "company_id",
+    //           type: "int",
+    //           required: true,
+    //         },
+    //         {
+    //           name: "property_id",
+    //           type: "int",
+    //         },
+    //         {
+    //           name: "building_id",
+    //           type: "int",
+    //           required: true,
+    //         },
+    //         {
+    //           name: "company_name",
+    //           type: "string",
+    //           required: true,
+    //         },
+    //         {
+    //           name: "building_name",
+    //           type: "string",
+    //           required: true,
+    //         },
+    //         {
+    //           name: "total",
+    //           type: "int",
+    //           required: true,
+    //         },
+    //         {
+    //           name: "actively_remote_read",
+    //           type: "int",
+    //         },
+    //         {
+    //           name: "active_manual_read",
+    //           type: "int",
+    //         },
+    //         {
+    //           name: "active_calculation_meters",
+    //           type: "int",
+    //         },
+    //         {
+    //           name: "inactive_remotely_read",
+    //           type: "int",
+    //         },
+    //         {
+    //           name: "inactive_manually_read",
+    //           type: "int",
+    //         },
+    //         {
+    //           name: "inactive_calculation_meters",
+    //           type: "int",
+    //         },
+    //         {
+    //           name: "unsupported_remotely_read",
+    //           type: "int",
+    //         },
+    //         {
+    //           name: "unsupported_manually_read",
+    //           type: "int",
+    //         },
+    //         {
+    //           name: "unsupported_calculation_meters",
+    //           type: "int",
+    //         },
+    //         {
+    //           name: "active_management_read",
+    //           type: "int",
+    //         },
+    //         {
+    //           name: "active_garbage_meter_read",
+    //           type: "int",
+    //         },
+    //       ],
+    //     },
+    //   },
+    //   snapshotManagement: {
+    //     maxSnapshotAgeHours: 24,
+    //     minSnapshotsToKeep: 3,
+    //     status: "enabled",
+    //   },
+    //   storageClassConfiguration: {
+    //     storageClass: "STANDARD",
+    //   },
+    //   tags: [
+    //     {
+    //       key: "Name",
+    //       value: "MetersTable",
+    //     },
+    //   ],
+    // });
+    // metersTable.addDependency(namespace);
 
     // Lambda function to configure partitioning and sort order
     const configureTableFn = new lambda.Function(
@@ -187,8 +187,6 @@ def handler(event, context):
         namespace = props['Namespace']
         table_name = props['TableName']
         table_bucket_arn = props['TableBucketArn']
-        partition_fields = props.get('PartitionFields', [])
-        sort_fields = props.get('SortFields', [])
         output_location = props['OutputLocation']
 
         # Only configure on Create and Update
@@ -196,30 +194,44 @@ def handler(event, context):
             query_execution_ids = []
 
             # Add partition fields using resource link
-            resource_link_db = f"{namespace}_link"
-            for field in partition_fields:
-                query = f"ALTER TABLE {resource_link_db}.{table_name} ADD PARTITION FIELD {field}"
-                print(f"Executing: {query}")
+            resource_link_db = f"{namespace}" // "_link"
+            query = f"CREATE TABLE IF NOT EXISTS {resource_link_db}.{table_name} (
+  timestamp timestamp,
+  company_id int,
+  property_id int,
+  building_id int,
+  company_name string,
+  building_name string,
+  total int,
+  actively_remote_read int,
+  active_manual_read int,
+  active_calculation_meters int,
+  inactive_remotely_read int,
+  inactive_manually_read int,
+  inactive_calculation_meters int,
+  unsupported_remotely_read int,
+  unsupported_manually_read int,
+  unsupported_calculation_meters int,
+  active_management_read int,
+  active_garbage_meter_read int)
+USING iceberg
+PARTITIONED BY (month(timestamp), bucket(4, company_id))
+TBLPROPERTIES (
+  'write.metadata.delete-after-commit.enabled'='true',
+  'write.metadata.previous-versions-max'='10',
+  'write.format.default' = 'parquet',
+  'write.parquet.compression-codec' = 'zstd', 
+  'format-version' = '2'
+  // 'table_type'='iceberg',
+);"
+            print(f"Executing: {query}")
 
-                response = athena.start_query_execution(
-                    QueryString=query,
-                    ResultConfiguration={'OutputLocation': output_location},
-                    QueryExecutionContext={'Database': resource_link_db}
-                )
-                query_execution_ids.append(response['QueryExecutionId'])
-
-            # Set sort order
-            if sort_fields:
-                sort_clause = ', '.join(sort_fields)
-                query = f"ALTER TABLE {resource_link_db}.{table_name} WRITE ORDERED BY {sort_clause}"
-                print(f"Executing: {query}")
-
-                response = athena.start_query_execution(
-                    QueryString=query,
-                    ResultConfiguration={'OutputLocation': output_location},
-                    QueryExecutionContext={'Database': resource_link_db}
-                )
-                query_execution_ids.append(response['QueryExecutionId'])
+            response = athena.start_query_execution(
+                QueryString=query,
+                ResultConfiguration={'OutputLocation': output_location},
+                QueryExecutionContext={'Database': resource_link_db}
+            )
+            query_execution_ids.append(response['QueryExecutionId'])
 
             # Wait for all queries to complete
             for query_id in query_execution_ids:
@@ -410,11 +422,9 @@ def handler(event, context):
           Namespace: namespace.namespace,
           TableName: metersTable.tableName,
           TableBucketArn: s3TableBucket.attrTableBucketArn,
-          PartitionFields: ["company_id"],
-          SortFields: ["company_id", "building_id"],
           OutputLocation: `s3://${tableBucket}-athena-results/`,
           // Force update by changing this version when needed
-          Version: "4",
+          Version: "5",
         },
       },
     );
