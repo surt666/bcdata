@@ -129,7 +129,7 @@ export class BcdataStack extends cdk.Stack {
               type: "int",
             },
             {
-              name: "active_styring_read",
+              name: "active_management_read",
               type: "int",
             },
             {
