@@ -59,6 +59,11 @@ export class BcdataStack extends cdk.Stack {
         icebergSchema: {
           schemaFieldList: [
             {
+              name: "timestamp",
+              type: "timestamp",
+              required: true,
+            },
+            {
               name: "company_id",
               type: "int",
               required: true,
@@ -92,7 +97,7 @@ export class BcdataStack extends cdk.Stack {
               type: "int",
             },
             {
-              name: "active_manual_readings",
+              name: "active_manual_read",
               type: "int",
             },
             {
@@ -123,6 +128,14 @@ export class BcdataStack extends cdk.Stack {
               name: "unsupported_calculation_meters",
               type: "int",
             },
+            {
+              name: "active_styring_read",
+              type: "int",
+            },
+            {
+              name: "active_garbage_meter_read",
+              type: "int",
+            },
           ],
         },
       },
@@ -144,11 +157,14 @@ export class BcdataStack extends cdk.Stack {
     metersTable.addDependency(namespace);
 
     // Lambda function to configure partitioning and sort order
-    const configureTableFn = new lambda.Function(this, "ConfigureTableFunction", {
-      runtime: lambda.Runtime.PYTHON_3_12,
-      handler: "index.handler",
-      timeout: cdk.Duration.minutes(5),
-      code: lambda.Code.fromInline(`
+    const configureTableFn = new lambda.Function(
+      this,
+      "ConfigureTableFunction",
+      {
+        runtime: lambda.Runtime.PYTHON_3_12,
+        handler: "index.handler",
+        timeout: cdk.Duration.minutes(5),
+        code: lambda.Code.fromInline(`
 import json
 import boto3
 import time
@@ -230,7 +246,8 @@ def handler(event, context):
             'Error': str(e)
         })
 `),
-    });
+      },
+    );
 
     // Grant permissions to Lambda
     configureTableFn.addToRolePolicy(
@@ -241,17 +258,14 @@ def handler(event, context):
           "athena:GetQueryResults",
         ],
         resources: ["*"],
-      })
+      }),
     );
 
     configureTableFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: [
-          "s3tables:GetTable",
-          "s3tables:UpdateTableMetadata",
-        ],
+        actions: ["s3tables:GetTable", "s3tables:UpdateTableMetadata"],
         resources: [s3TableBucket.attrTableBucketArn + "/*"],
-      })
+      }),
     );
 
     configureTableFn.addToRolePolicy(
@@ -269,14 +283,14 @@ def handler(event, context):
           athenaResultsBucket.bucketArn,
           `${athenaResultsBucket.bucketArn}/*`,
         ],
-      })
+      }),
     );
 
     configureTableFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["glue:GetDatabase", "glue:GetTable"],
         resources: ["*"],
-      })
+      }),
     );
 
     configureTableFn.addToRolePolicy(
@@ -287,7 +301,7 @@ def handler(event, context):
           "lakeformation:RevokePermissions",
         ],
         resources: ["*"],
-      })
+      }),
     );
 
     // Create Glue resource link for S3 Tables
@@ -318,7 +332,7 @@ def handler(event, context):
           },
         },
         permissions: ["ALL"],
-      }
+      },
     );
     lambdaResourceLinkDbPermissions.node.addDependency(resourceLink);
 
@@ -338,7 +352,7 @@ def handler(event, context):
           },
         },
         permissions: ["SELECT", "INSERT", "DELETE", "DESCRIBE", "ALTER"],
-      }
+      },
     );
     lambdaResourceLinkTablePermissions.node.addDependency(resourceLink);
 
@@ -357,7 +371,7 @@ def handler(event, context):
           },
         },
         permissions: ["ALL"],
-      }
+      },
     );
     lambdaS3TablesDbPermissions.node.addDependency(namespace);
 
@@ -377,7 +391,7 @@ def handler(event, context):
           },
         },
         permissions: ["SELECT", "INSERT", "DELETE", "DESCRIBE", "ALTER"],
-      }
+      },
     );
     lambdaS3TablesTablePermissions.node.addDependency(metersTable);
 
@@ -402,7 +416,7 @@ def handler(event, context):
           // Force update by changing this version when needed
           Version: "4",
         },
-      }
+      },
     );
 
     configureTableResource.node.addDependency(metersTable);
