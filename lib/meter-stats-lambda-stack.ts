@@ -59,11 +59,14 @@ def handler(event, context):
             body = event
 
         # Extract parameters
-        month = int(body.get('month', 1))
+        date = body.get('date', '')
         id_string = body.get('id', '')
 
         if not id_string:
             raise ValueError("Missing required parameter: id")
+
+        if not date:
+            raise ValueError("Missing required parameter: date")
 
         # Parse ID string format: C#<nr> or C#<nr>#P#<nr> or C#<nr>#P#<nr>#B#<nr>
         # Examples: C#3, C#3#P#1, C#3#P#1#B#5
@@ -84,9 +87,6 @@ def handler(event, context):
         if company_id is None:
             raise ValueError(f"Invalid id format. Must contain at least C#<nr>, got: {id_string}")
 
-        # Default year to current year
-        year = 2026
-
         # Get environment variables
         table_bucket_name = os.environ['TABLE_BUCKET_NAME']
         namespace = os.environ['NAMESPACE']
@@ -101,9 +101,9 @@ def handler(event, context):
             result_id += f'#B#{building_id}'
 
         # Build WHERE clause dynamically based on provided IDs
+        # Format date as SQL date literal
         where_clauses = [
-            f"month(timestamp) = {month}",
-            f"year(timestamp) = {year}",
+            f"date(timestamp) = date '{date}'",
             f"company_id = {company_id}"
         ]
 
@@ -119,18 +119,19 @@ def handler(event, context):
         # Note: We don't prefix the table name with the database since it's set in QueryExecutionContext
         query = f"""
 SELECT '{result_id}' as id,
-       sum(total) as total,
-       sum(actively_remote_read) as actively_remote_read,
-       sum(active_manual_read) as active_manual_read,
-       sum(active_calculation_meters) as active_calculation_meter,
-       sum(inactive_remotely_read) as inactive_remotely_read,
-       sum(inactive_manually_read) as inactive_manually_read,
-       sum(inactive_calculation_meters) as inactive_calculation_meters,
-       sum(unsupported_remotely_read) as unsupported_remotely_read,
-       sum(unsupported_manually_read) as unsupported_manually_read,
-       sum(unsupported_calculation_meters) as unsupported_calculation_meters,
-       sum(active_management_read) as active_management_read,
-       sum(active_garbage_meter_read) as active_garbage_meter_read
+	   building_name,
+       total,
+       actively_remote_read,
+       active_manual_read,
+       active_calculation_meters,
+       inactive_remotely_read,
+       inactive_manually_read,
+       inactive_calculation_meters,
+       unsupported_remotely_read,
+       unsupported_manually_read,
+       unsupported_calculation_meters,
+       active_management_read,
+       active_garbage_meter_read
 FROM {table_name}
 WHERE {where_clause}
 """
@@ -182,30 +183,36 @@ WHERE {where_clause}
                 'headers': {'Content-Type': 'application/json'},
                 'body': json.dumps({
                     'message': 'No data found',
-                    'data': None
+                    'data': []
                 })
             }
 
         # Extract column names from first row
         columns = [col['VarCharValue'] for col in rows[0]['Data']]
 
-        # Extract data from second row
-        values = []
-        for col in rows[1]['Data']:
-            val = col.get('VarCharValue', '0')
-            # Try to convert to int, fallback to string
-            try:
-                values.append(int(val))
-            except ValueError:
-                values.append(val)
+        # Extract data from all remaining rows
+        result_data = []
+        for row in rows[1:]:  # Skip header row
+            values = []
+            for col in row['Data']:
+                val = col.get('VarCharValue', '0')
+                # Try to convert to int, fallback to string
+                try:
+                    values.append(int(val))
+                except ValueError:
+                    values.append(val)
 
-        # Build result object
-        result_data = dict(zip(columns, values))
+            # Build row object
+            row_data = dict(zip(columns, values))
+            result_data.append(row_data)
 
         return {
             'statusCode': 200,
             'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps(result_data)
+            'body': json.dumps({
+                'data': result_data,
+                'count': len(result_data),
+            })
         }
 
     except Exception as e:
