@@ -13,7 +13,7 @@ export class BcdataStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    const tableBucket = "billing";
+    const tableBucket = "billing5";
 
     // S3 bucket for Athena query results
     const athenaResultsBucket = new s3.Bucket(this, "AthenaResultsBucket", {
@@ -187,15 +187,15 @@ def handler(event, context):
         namespace = props['Namespace']
         table_name = props['TableName']
         table_bucket_arn = props['TableBucketArn']
+        table_bucket_name = props['TableBucketName']
         output_location = props['OutputLocation']
 
         # Only configure on Create and Update
         if request_type in ['Create', 'Update']:
             query_execution_ids = []
 
-            # Add partition fields using resource link
-            resource_link_db = f"{namespace}" // "_link"
-            query = f"CREATE TABLE IF NOT EXISTS {resource_link_db}.{table_name} (
+            # Create table in S3 Tables catalog
+            query = f"""CREATE TABLE IF NOT EXISTS {table_name} (
   timestamp timestamp,
   company_id int,
   property_id int,
@@ -214,22 +214,20 @@ def handler(event, context):
   unsupported_calculation_meters int,
   active_management_read int,
   active_garbage_meter_read int)
-USING iceberg
 PARTITIONED BY (month(timestamp), bucket(4, company_id))
 TBLPROPERTIES (
-  'write.metadata.delete-after-commit.enabled'='true',
-  'write.metadata.previous-versions-max'='10',
-  'write.format.default' = 'parquet',
-  'write.parquet.compression-codec' = 'zstd', 
-  'format-version' = '2'
-  // 'table_type'='iceberg',
-);"
+  'table_type' = 'iceberg'
+)"""
             print(f"Executing: {query}")
 
             response = athena.start_query_execution(
                 QueryString=query,
                 ResultConfiguration={'OutputLocation': output_location},
-                QueryExecutionContext={'Database': resource_link_db}
+                QueryExecutionContext={
+                    'Catalog': f's3tablescatalog/{table_bucket_name}',
+                    'Database': namespace
+                },
+                WorkGroup='primary'
             )
             query_execution_ids.append(response['QueryExecutionId'])
 
@@ -260,6 +258,34 @@ TBLPROPERTIES (
 `),
       },
     );
+
+    // Create custom resource provider
+    const provider = new cr.Provider(this, "ConfigureTableProvider", {
+      onEventHandler: configureTableFn,
+    });
+
+    const tablename = "meters";
+    // Create custom resource
+    const configureTableResource = new cdk.CustomResource(
+      this,
+      "ConfigureTableResource",
+      {
+        serviceToken: provider.serviceToken,
+        properties: {
+          Namespace: namespace.namespace,
+          TableName: tablename,
+          TableBucketArn: s3TableBucket.attrTableBucketArn,
+          TableBucketName: tableBucket,
+          OutputLocation: `s3://${tableBucket}-athena-results/`,
+          // Force update by changing this version when needed
+          Version: "12",
+        },
+      },
+    );
+
+    configureTableResource.node.addDependency(namespace);
+    configureTableResource.node.addDependency(athenaResultsBucket);
+    configureTableResource.node.addDependency(configureTableFn);
 
     // Grant permissions to Lambda
     configureTableFn.addToRolePolicy(
@@ -347,6 +373,8 @@ TBLPROPERTIES (
       },
     );
     lambdaResourceLinkDbPermissions.node.addDependency(resourceLink);
+    lambdaResourceLinkDbPermissions.node.addDependency(namespace);
+    lambdaResourceLinkDbPermissions.node.addDependency(configureTableResource);
 
     // Grant Lake Formation permissions on resource link tables
     const lambdaResourceLinkTablePermissions = new lakeformation.CfnPermissions(
@@ -367,6 +395,10 @@ TBLPROPERTIES (
       },
     );
     lambdaResourceLinkTablePermissions.node.addDependency(resourceLink);
+    lambdaResourceLinkTablePermissions.node.addDependency(namespace);
+    lambdaResourceLinkTablePermissions.node.addDependency(
+      configureTableResource,
+    );
 
     // Grant Lake Formation permissions on actual S3 Tables database
     const lambdaS3TablesDbPermissions = new lakeformation.CfnPermissions(
@@ -386,6 +418,7 @@ TBLPROPERTIES (
       },
     );
     lambdaS3TablesDbPermissions.node.addDependency(namespace);
+    lambdaS3TablesDbPermissions.node.addDependency(configureTableResource);
 
     // Grant Lake Formation permissions on actual S3 Tables
     const lambdaS3TablesTablePermissions = new lakeformation.CfnPermissions(
@@ -405,32 +438,8 @@ TBLPROPERTIES (
         permissions: ["SELECT", "INSERT", "DELETE", "DESCRIBE", "ALTER"],
       },
     );
-    lambdaS3TablesTablePermissions.node.addDependency(metersTable);
-
-    // Create custom resource provider
-    const provider = new cr.Provider(this, "ConfigureTableProvider", {
-      onEventHandler: configureTableFn,
-    });
-
-    // Create custom resource
-    const configureTableResource = new cdk.CustomResource(
-      this,
-      "ConfigureTableResource",
-      {
-        serviceToken: provider.serviceToken,
-        properties: {
-          Namespace: namespace.namespace,
-          TableName: metersTable.tableName,
-          TableBucketArn: s3TableBucket.attrTableBucketArn,
-          OutputLocation: `s3://${tableBucket}-athena-results/`,
-          // Force update by changing this version when needed
-          Version: "5",
-        },
-      },
-    );
-
-    configureTableResource.node.addDependency(metersTable);
-    configureTableResource.node.addDependency(athenaResultsBucket);
+    lambdaS3TablesTablePermissions.node.addDependency(configureTableResource);
+    lambdaS3TablesTablePermissions.node.addDependency(namespace);
 
     // Table bucket policy to control access
     new s3tables.CfnTableBucketPolicy(this, "BillingTableBucketPolicy", {
