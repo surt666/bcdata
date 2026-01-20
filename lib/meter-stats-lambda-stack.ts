@@ -118,7 +118,7 @@ def handler(event, context):
         # Build the Athena query
         # Note: We don't prefix the table name with the database since it's set in QueryExecutionContext
         query = f"""
-SELECT '{result_id}' as id,
+SELECT CONCAT('C#', CAST(company_id AS VARCHAR), '#P#', CAST(property_id AS VARCHAR), '#B#', CAST(building_id AS VARCHAR)) as id,
 	   building_name,
        total,
        actively_remote_read,
