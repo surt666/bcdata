@@ -7,13 +7,16 @@ import * as cr from "aws-cdk-lib/custom-resources";
 import * as lakeformation from "aws-cdk-lib/aws-lakeformation";
 import * as glue from "aws-cdk-lib/aws-glue";
 import * as s3 from "aws-cdk-lib/aws-s3";
+import * as s3Deployment from "aws-cdk-lib/aws-s3-deployment";
+import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
+
 // import * as sqs from 'aws-cdk-lib/aws-sqs';
 
 export class BcdataStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    const tableBucket = "billing5";
+    const tableBucket = "billing9";
 
     // S3 bucket for Athena query results
     const athenaResultsBucket = new s3.Bucket(this, "AthenaResultsBucket", {
@@ -39,7 +42,7 @@ export class BcdataStack extends cdk.Stack {
     );
 
     const namespace = new s3tables.CfnNamespace(this, "BillingDataNamespace", {
-      namespace: "billingdata",
+      namespace: "billingdata6",
       tableBucketArn: s3TableBucket.attrTableBucketArn,
     });
     namespace.addDependency(s3TableBucket);
@@ -214,7 +217,7 @@ def handler(event, context):
   unsupported_calculation_meters int,
   active_management_read int,
   active_garbage_meter_read int)
-PARTITIONED BY (month(timestamp), bucket(4, company_id))
+PARTITIONED BY (month(timestamp), bucket(4, company_id), bucket(4, property_id), bucket(4, building_id))
 TBLPROPERTIES (
   'table_type' = 'iceberg'
 )"""
@@ -224,7 +227,7 @@ TBLPROPERTIES (
                 QueryString=query,
                 ResultConfiguration={'OutputLocation': output_location},
                 QueryExecutionContext={
-                    'Catalog': f's3tablescatalog/{table_bucket_name}',
+                    'Catalog': f'arn:aws:s3tables:eu-central-1:891377204778:bucket/{table_bucket_name}', # f's3tablescatalog/{table_bucket_name}',
                     'Database': namespace
                 },
                 WorkGroup='primary'
@@ -278,7 +281,7 @@ TBLPROPERTIES (
           TableBucketName: tableBucket,
           OutputLocation: `s3://${tableBucket}-athena-results/`,
           // Force update by changing this version when needed
-          Version: "12",
+          Version: "13",
         },
       },
     );
@@ -464,6 +467,129 @@ TBLPROPERTIES (
         ],
       },
       tableBucketArn: s3TableBucket.attrTableBucketArn,
+    });
+
+    const scriptBucket = s3.Bucket.fromBucketName(
+      this,
+      "GlueAssetsBucket",
+      `aws-glue-assets-${this.account}-${this.region}`,
+    );
+
+    const script = `
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+import gs_now
+import gs_derived
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Script generated for node AWS Glue Data Catalog
+AWSGlueDataCatalog_node1768987644464 = glueContext.create_dynamic_frame.from_catalog(database="default", table_name="billing", transformation_ctx="AWSGlueDataCatalog_node1768987644464")
+
+# Script generated for node AWS Glue Data Catalog
+AWSGlueDataCatalog_node1768987646296 = glueContext.create_dynamic_frame.from_catalog(database="default", table_name="meter_stats", transformation_ctx="AWSGlueDataCatalog_node1768987646296")
+
+# Script generated for node Join
+AWSGlueDataCatalog_node1768987644464DF = AWSGlueDataCatalog_node1768987644464.toDF()
+AWSGlueDataCatalog_node1768987646296DF = AWSGlueDataCatalog_node1768987646296.toDF()
+Join_node1768989107485 = DynamicFrame.fromDF(AWSGlueDataCatalog_node1768987644464DF.join(AWSGlueDataCatalog_node1768987646296DF, (AWSGlueDataCatalog_node1768987644464DF['firmaid'] == AWSGlueDataCatalog_node1768987646296DF['company_id']) & (AWSGlueDataCatalog_node1768987644464DF['bygningid'] == AWSGlueDataCatalog_node1768987646296DF['building_id']), "right"), glueContext, "Join_node1768989107485")
+
+# Script generated for node Add Current Timestamp
+AddCurrentTimestamp_node1768988742764 = Join_node1768989107485.gs_now(colName="timestamp", dateFormat="%Y-%m-%d %H:%M:%S")
+
+# Script generated for node Timestamp
+Timestamp_node1768989553161 = AddCurrentTimestamp_node1768988742764.gs_derived(colName="active_management_read", expr="temperatursum + kanalantal")
+
+# Script generated for node ParentId
+ParentId_node1769001479628 = Timestamp_node1768989553161.gs_derived(colName="parent_id", expr="1")
+
+# Script generated for node Change Schema
+ChangeSchema_node1768988555406 = ApplyMapping.apply(frame=ParentId_node1769001479628, mappings=[("timestamp", "string", "timestamp", "timestamp"), ("company_id", "long", "company_id", "int"), ("parent_id", "int", "property_id", "int"), ("building_id", "long", "building_id", "int"), ("building", "string", "building_name", "string"), ("total", "long", "total", "int"), ("active_remotely_read", "long", "actively_remote_read", "int"), ("active_manual_readings", "long", "active_manual_read", "int"), ("active_calculation_meters", "long", "active_calculation_meters", "int"), ("inactive_remotely_read", "long", "inactive_remotely_read", "int"), ("inactive_manual_readings", "long", "inactive_manually_read", "int"), ("inactive_calculation_meters", "long", "inactive_calculation_meters", "int"), ("unsupported_remotely_read", "long", "unsupported_remotely_read", "int"), ("unsupported_manual_readings", "long", "unsupported_manually_read", "int"), ("unsupported_calculation_meters", "long", "unsupported_calculation_meters", "int"), ("active_management_read", "long", "active_management_read", "int"), ("boxAntal", "long", "active_garbage_meter_read", "int")], transformation_ctx="ChangeSchema_node1768988555406")
+
+# Script generated for node AWS Glue Data Catalog
+AWSGlueDataCatalog_node1768987880200_df = ChangeSchema_node1768988555406.toDF()
+AWSGlueDataCatalog_node1768987880200 = glueContext.write_data_frame.from_catalog(frame=AWSGlueDataCatalog_node1768987880200_df, database="billingdata_link", table_name="meters", additional_options={})
+job.commit()`;
+
+    const deployment = new s3Deployment.BucketDeployment(this, "DeployScript", {
+      sources: [s3Deployment.Source.data("glue_billing_job.py", script)],
+      destinationBucket: scriptBucket,
+      destinationKeyPrefix: "glue-scripts/",
+      prune: false,
+    });
+
+    // Reference the uploaded script
+    const scriptLocation = `s3://${scriptBucket.bucketName}/glue-scripts/glue_billing_job.py`;
+
+    // Reference existing IAM role
+    const glueJobRole = iam.Role.fromRoleName(
+      this,
+      "DaqJobRole",
+      "daq-job-role",
+    );
+
+    // Create the Glue Job
+    const billingJob = new glue.CfnJob(this, "DaqbillingJob", {
+      name: "daq-billing-job",
+      role: glueJobRole.roleArn,
+      command: {
+        name: "gluebilling",
+        pythonVersion: "3",
+        scriptLocation: scriptLocation,
+      },
+      glueVersion: "4.0",
+      workerType: "G.1X",
+      numberOfWorkers: 2,
+      executionProperty: {
+        maxConcurrentRuns: 3, // Allow multiple concurrent runs for billing job reliability
+      },
+      defaultArguments: {
+        "--enable-metrics": "true",
+        "--enable-spark-ui": "true",
+        "--enable-job-insights": "true",
+        "--enable-continuous-cloudwatch-log": "true",
+        "--enable-glue-datacatalog": "true",
+        "--job-language": "python",
+        "--enable-auto-scaling": "false",
+        "--TempDir": `s3://aws-glue-assets-${this.env?.account}-${this.env?.region}/temporary/`,
+        "--spark-event-logs-path": `s3://aws-glue-assets-${this.env?.account}-${this.env?.region}/sparkHistoryLogs/`,
+        "--datalake-formats": "iceberg",
+        "--extra-py-files": `s3://aws-glue-studio-transforms-560373232017-prod-eu-central-1/gs_common.py,s3://aws-glue-studio-transforms-560373232017-prod-eu-central-1/gs_now.py,s3://aws-glue-studio-transforms-560373232017-prod-eu-central-1/gs_derived.py`,
+      },
+      executionClass: "STANDARD",
+      jobRunQueuingEnabled: true,
+      maintenanceWindow: "Sun:2",
+    });
+    billingJob.node.addDependency(deployment);
+
+    const jobName = billingJob.name || billingJob.node.id;
+
+    new cloudwatch.Alarm(this, "GlueJobFailureAlarm", {
+      alarmName: `glue-job-failure-${jobName}`,
+      metric: new cloudwatch.Metric({
+        namespace: "AWS/Glue",
+        metricName: "glue.driver.aggregate.numFailedTasks",
+        dimensionsMap: {
+          JobName: jobName,
+        },
+        statistic: "Sum",
+        period: cdk.Duration.minutes(1),
+      }),
+      threshold: 0,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      evaluationPeriods: 1,
+      alarmDescription: `Alarm triggered when Glue job ${jobName} has failed tasks`,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
   }
 }
