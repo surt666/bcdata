@@ -9,6 +9,7 @@ import * as glue from "aws-cdk-lib/aws-glue";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3Deployment from "aws-cdk-lib/aws-s3-deployment";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
+import * as ssm from "aws-cdk-lib/aws-ssm";
 
 // import * as sqs from 'aws-cdk-lib/aws-sqs';
 
@@ -16,7 +17,7 @@ export class BcdataStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    const tableBucket = "billing9";
+    const tableBucket = "billing10";
 
     // S3 bucket for Athena query results
     const athenaResultsBucket = new s3.Bucket(this, "AthenaResultsBucket", {
@@ -24,6 +25,83 @@ export class BcdataStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
     });
+
+    // S3 bucket for meter stats CSV files from ingestion
+    const meterStatsIngestionBucket = new s3.Bucket(
+      this,
+      "MeterStatsIngestionBucket",
+      {
+        bucketName: `billing-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
+        versioned: false,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+        autoDeleteObjects: false,
+        lifecycleRules: [
+          {
+            id: "DeleteOldCsvFiles",
+            enabled: true,
+            prefix: "meter-stats/",
+            expiration: cdk.Duration.days(90),
+          },
+        ],
+      },
+    );
+
+    // Store bucket name in SSM Parameter Store for other stacks to use
+    new ssm.StringParameter(this, "MeterStatsIngestionBucketParameter", {
+      parameterName: "/bcdata/meter-stats-ingestion-bucket",
+      stringValue: meterStatsIngestionBucket.bucketName,
+      description: "S3 bucket name for meter stats CSV ingestion",
+      tier: ssm.ParameterTier.ADVANCED,
+    });
+
+    // Get ingestion account ID from context (for cross-account access)
+    const ingestionAccountId = this.node.tryGetContext("INGESTION_ACCOUNT_ID");
+
+    // Only create cross-account resources if INGESTION_ACCOUNT_ID is provided
+    if (ingestionAccountId) {
+      // Create role that allows ingestion Lambda to read SSM parameters
+      const ssmReadRole = new iam.Role(this, "BcdataSSMReadRole", {
+        roleName: "BcdataSSMReadRole",
+        assumedBy: new iam.AccountPrincipal(ingestionAccountId),
+        description:
+          "Role to allow meter stats ingestion Lambda to read SSM parameters",
+      });
+
+      ssmReadRole.addToPolicy(
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: ["ssm:GetParameter", "ssm:GetParameters"],
+          resources: [
+            `arn:aws:ssm:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:parameter/bcdata/*`,
+          ],
+        }),
+      );
+
+      // Grant cross-account S3 bucket access to ingestion account
+      meterStatsIngestionBucket.addToResourcePolicy(
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          principals: [new iam.AccountPrincipal(ingestionAccountId)],
+          actions: ["s3:PutObject", "s3:PutObjectAcl", "s3:GetObject"],
+          resources: [`${meterStatsIngestionBucket.bucketArn}/*`],
+        }),
+      );
+
+      meterStatsIngestionBucket.addToResourcePolicy(
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          principals: [new iam.AccountPrincipal(ingestionAccountId)],
+          actions: ["s3:ListBucket", "s3:GetBucketLocation"],
+          resources: [meterStatsIngestionBucket.bucketArn],
+        }),
+      );
+    } else {
+      // Add a warning that cross-account access won't be configured
+      cdk.Annotations.of(this).addWarning(
+        "INGESTION_ACCOUNT_ID not provided. Cross-account S3 bucket access and SSM read role will not be created. " +
+          "Provide via: cdk deploy -c INGESTION_ACCOUNT_ID=123456789012",
+      );
+    }
 
     const s3TableBucket = new s3tables.CfnTableBucket(
       this,
@@ -47,6 +125,169 @@ export class BcdataStack extends cdk.Stack {
     });
     namespace.addDependency(s3TableBucket);
 
+    // Create Glue resource link for S3 Tables
+    const resourceLink = new glue.CfnDatabase(this, "S3TablesResourceLink", {
+      catalogId: cdk.Aws.ACCOUNT_ID,
+      databaseInput: {
+        name: `${namespace.namespace}_link`,
+        targetDatabase: {
+          catalogId: `${cdk.Aws.ACCOUNT_ID}:s3tablescatalog/${tableBucket}`,
+          databaseName: namespace.namespace,
+        },
+      },
+    });
+    resourceLink.node.addDependency(namespace);
+
+    const configureTableFnRole = new iam.Role(this, "LambdaRole", {
+      assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName(
+          "service-role/AWSLambdaBasicExecutionRole",
+        ),
+      ],
+    });
+    // Grant permissions to Lambda
+    configureTableFnRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "athena:StartQueryExecution",
+          "athena:GetQueryExecution",
+          "athena:GetQueryResults",
+          "glue:GetDataCatalog",
+        ],
+        resources: ["*"],
+      }),
+    );
+
+    configureTableFnRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "s3tables:GetTable",
+          "s3tables:GetTableMetadata",
+          "s3tables:PutTableData",
+          "s3tables:GetTableData",
+          "s3tables:DeleteTableData",
+          "s3tables:UpdateTableMetadata",
+        ],
+        resources: [s3TableBucket.attrTableBucketArn + "/*"],
+      }),
+    );
+
+    configureTableFnRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:ListBucket",
+          "s3:GetBucketLocation",
+          "s3:ListBucketMultipartUploads",
+          "s3:ListMultipartUploadParts",
+          "s3:AbortMultipartUpload",
+        ],
+        resources: [
+          athenaResultsBucket.bucketArn,
+          `${athenaResultsBucket.bucketArn}/*`,
+        ],
+      }),
+    );
+
+    configureTableFnRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["glue:GetDatabase", "glue:GetTable"],
+        resources: ["*"],
+      }),
+    );
+
+    configureTableFnRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "lakeformation:GetDataAccess",
+          "lakeformation:GrantPermissions",
+          "lakeformation:RevokePermissions",
+        ],
+        resources: ["*"],
+      }),
+    );
+
+    // Grant Lake Formation permissions on the resource link database
+    const lambdaResourceLinkDbPermissions = new lakeformation.CfnPermissions(
+      this,
+      "LambdaResourceLinkDbPermissions",
+      {
+        dataLakePrincipal: {
+          dataLakePrincipalIdentifier: configureTableFnRole.roleArn,
+        },
+        resource: {
+          databaseResource: {
+            name: `${namespace.namespace}_link`,
+            catalogId: cdk.Aws.ACCOUNT_ID,
+          },
+        },
+        permissions: ["ALL"],
+      },
+    );
+    lambdaResourceLinkDbPermissions.node.addDependency(resourceLink);
+    lambdaResourceLinkDbPermissions.node.addDependency(namespace);
+
+    // Grant Lake Formation permissions on resource link tables
+    const lambdaResourceLinkTablePermissions = new lakeformation.CfnPermissions(
+      this,
+      "LambdaResourceLinkTablePermissions",
+      {
+        dataLakePrincipal: {
+          dataLakePrincipalIdentifier: configureTableFnRole.roleArn,
+        },
+        resource: {
+          tableResource: {
+            databaseName: `${namespace.namespace}_link`,
+            catalogId: cdk.Aws.ACCOUNT_ID,
+            tableWildcard: {},
+          },
+        },
+        permissions: ["SELECT", "INSERT", "DELETE", "DESCRIBE", "ALTER"],
+      },
+    );
+    lambdaResourceLinkTablePermissions.node.addDependency(resourceLink);
+    lambdaResourceLinkTablePermissions.node.addDependency(namespace);
+
+    // Grant Lake Formation permissions on actual S3 Tables database
+    const lambdaS3TablesDbPermissions = new lakeformation.CfnPermissions(
+      this,
+      "LambdaS3TablesDbPermissions",
+      {
+        dataLakePrincipal: {
+          dataLakePrincipalIdentifier: configureTableFnRole.roleArn,
+        },
+        resource: {
+          databaseResource: {
+            name: namespace.namespace,
+            catalogId: `${cdk.Aws.ACCOUNT_ID}:s3tablescatalog/${tableBucket}`,
+          },
+        },
+        permissions: ["ALL"],
+      },
+    );
+    lambdaS3TablesDbPermissions.node.addDependency(namespace);
+
+    // Grant Lake Formation permissions on actual S3 Tables
+    const lambdaS3TablesTablePermissions = new lakeformation.CfnPermissions(
+      this,
+      "LambdaS3TablesTablePermissions",
+      {
+        dataLakePrincipal: {
+          dataLakePrincipalIdentifier: configureTableFnRole.roleArn,
+        },
+        resource: {
+          tableResource: {
+            databaseName: namespace.namespace,
+            catalogId: `${cdk.Aws.ACCOUNT_ID}:s3tablescatalog/${tableBucket}`,
+            tableWildcard: {},
+          },
+        },
+        permissions: ["SELECT", "INSERT", "DELETE", "DESCRIBE", "ALTER"],
+      },
+    );
+    lambdaS3TablesTablePermissions.node.addDependency(namespace);
     // const metersTable = new s3tables.CfnTable(this, "meterstable", {
     //   namespace: namespace.namespace,
     //   openTableFormat: "ICEBERG",
@@ -167,6 +408,7 @@ export class BcdataStack extends cdk.Stack {
         runtime: lambda.Runtime.PYTHON_3_12,
         handler: "index.handler",
         timeout: cdk.Duration.minutes(5),
+        role: configureTableFnRole,
         code: lambda.Code.fromInline(`
 import json
 import boto3
@@ -225,12 +467,11 @@ TBLPROPERTIES (
 
             response = athena.start_query_execution(
                 QueryString=query,
-                ResultConfiguration={'OutputLocation': output_location},
                 QueryExecutionContext={
-                    'Catalog': f'arn:aws:s3tables:eu-central-1:891377204778:bucket/{table_bucket_name}', # f's3tablescatalog/{table_bucket_name}',
+                    'Catalog': f's3tablescatalog/{table_bucket_name}',
                     'Database': namespace
                 },
-                WorkGroup='primary'
+                WorkGroup='billing'
             )
             query_execution_ids.append(response['QueryExecutionId'])
 
@@ -281,7 +522,7 @@ TBLPROPERTIES (
           TableBucketName: tableBucket,
           OutputLocation: `s3://${tableBucket}-athena-results/`,
           // Force update by changing this version when needed
-          Version: "13",
+          Version: "21",
         },
       },
     );
@@ -289,160 +530,7 @@ TBLPROPERTIES (
     configureTableResource.node.addDependency(namespace);
     configureTableResource.node.addDependency(athenaResultsBucket);
     configureTableResource.node.addDependency(configureTableFn);
-
-    // Grant permissions to Lambda
-    configureTableFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: [
-          "athena:StartQueryExecution",
-          "athena:GetQueryExecution",
-          "athena:GetQueryResults",
-        ],
-        resources: ["*"],
-      }),
-    );
-
-    configureTableFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ["s3tables:GetTable", "s3tables:UpdateTableMetadata"],
-        resources: [s3TableBucket.attrTableBucketArn + "/*"],
-      }),
-    );
-
-    configureTableFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: [
-          "s3:PutObject",
-          "s3:GetObject",
-          "s3:ListBucket",
-          "s3:GetBucketLocation",
-          "s3:ListBucketMultipartUploads",
-          "s3:ListMultipartUploadParts",
-          "s3:AbortMultipartUpload",
-        ],
-        resources: [
-          athenaResultsBucket.bucketArn,
-          `${athenaResultsBucket.bucketArn}/*`,
-        ],
-      }),
-    );
-
-    configureTableFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ["glue:GetDatabase", "glue:GetTable"],
-        resources: ["*"],
-      }),
-    );
-
-    configureTableFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: [
-          "lakeformation:GetDataAccess",
-          "lakeformation:GrantPermissions",
-          "lakeformation:RevokePermissions",
-        ],
-        resources: ["*"],
-      }),
-    );
-
-    // Create Glue resource link for S3 Tables
-    const resourceLink = new glue.CfnDatabase(this, "S3TablesResourceLink", {
-      catalogId: cdk.Aws.ACCOUNT_ID,
-      databaseInput: {
-        name: `${namespace.namespace}_link`,
-        targetDatabase: {
-          catalogId: `${cdk.Aws.ACCOUNT_ID}:s3tablescatalog/${tableBucket}`,
-          databaseName: namespace.namespace,
-        },
-      },
-    });
-    resourceLink.node.addDependency(namespace);
-
-    // Grant Lake Formation permissions on the resource link database
-    const lambdaResourceLinkDbPermissions = new lakeformation.CfnPermissions(
-      this,
-      "LambdaResourceLinkDbPermissions",
-      {
-        dataLakePrincipal: {
-          dataLakePrincipalIdentifier: configureTableFn.role!.roleArn,
-        },
-        resource: {
-          databaseResource: {
-            name: `${namespace.namespace}_link`,
-            catalogId: cdk.Aws.ACCOUNT_ID,
-          },
-        },
-        permissions: ["ALL"],
-      },
-    );
-    lambdaResourceLinkDbPermissions.node.addDependency(resourceLink);
-    lambdaResourceLinkDbPermissions.node.addDependency(namespace);
-    lambdaResourceLinkDbPermissions.node.addDependency(configureTableResource);
-
-    // Grant Lake Formation permissions on resource link tables
-    const lambdaResourceLinkTablePermissions = new lakeformation.CfnPermissions(
-      this,
-      "LambdaResourceLinkTablePermissions",
-      {
-        dataLakePrincipal: {
-          dataLakePrincipalIdentifier: configureTableFn.role!.roleArn,
-        },
-        resource: {
-          tableResource: {
-            databaseName: `${namespace.namespace}_link`,
-            catalogId: cdk.Aws.ACCOUNT_ID,
-            tableWildcard: {},
-          },
-        },
-        permissions: ["SELECT", "INSERT", "DELETE", "DESCRIBE", "ALTER"],
-      },
-    );
-    lambdaResourceLinkTablePermissions.node.addDependency(resourceLink);
-    lambdaResourceLinkTablePermissions.node.addDependency(namespace);
-    lambdaResourceLinkTablePermissions.node.addDependency(
-      configureTableResource,
-    );
-
-    // Grant Lake Formation permissions on actual S3 Tables database
-    const lambdaS3TablesDbPermissions = new lakeformation.CfnPermissions(
-      this,
-      "LambdaS3TablesDbPermissions",
-      {
-        dataLakePrincipal: {
-          dataLakePrincipalIdentifier: configureTableFn.role!.roleArn,
-        },
-        resource: {
-          databaseResource: {
-            name: namespace.namespace,
-            catalogId: `${cdk.Aws.ACCOUNT_ID}:s3tablescatalog/${tableBucket}`,
-          },
-        },
-        permissions: ["ALL"],
-      },
-    );
-    lambdaS3TablesDbPermissions.node.addDependency(namespace);
-    lambdaS3TablesDbPermissions.node.addDependency(configureTableResource);
-
-    // Grant Lake Formation permissions on actual S3 Tables
-    const lambdaS3TablesTablePermissions = new lakeformation.CfnPermissions(
-      this,
-      "LambdaS3TablesTablePermissions",
-      {
-        dataLakePrincipal: {
-          dataLakePrincipalIdentifier: configureTableFn.role!.roleArn,
-        },
-        resource: {
-          tableResource: {
-            databaseName: namespace.namespace,
-            catalogId: `${cdk.Aws.ACCOUNT_ID}:s3tablescatalog/${tableBucket}`,
-            tableWildcard: {},
-          },
-        },
-        permissions: ["SELECT", "INSERT", "DELETE", "DESCRIBE", "ALTER"],
-      },
-    );
-    lambdaS3TablesTablePermissions.node.addDependency(configureTableResource);
-    lambdaS3TablesTablePermissions.node.addDependency(namespace);
+    configureTableResource.node.addDependency(resourceLink);
 
     // Table bucket policy to control access
     new s3tables.CfnTableBucketPolicy(this, "BillingTableBucketPolicy", {
@@ -539,7 +627,7 @@ job.commit()`;
     );
 
     // Create the Glue Job
-    const billingJob = new glue.CfnJob(this, "DaqbillingJob", {
+    const billingJob = new glue.CfnJob(this, "DaqBillingJob", {
       name: "daq-billing-job",
       role: glueJobRole.roleArn,
       command: {
@@ -564,11 +652,11 @@ job.commit()`;
         "--TempDir": `s3://aws-glue-assets-${this.env?.account}-${this.env?.region}/temporary/`,
         "--spark-event-logs-path": `s3://aws-glue-assets-${this.env?.account}-${this.env?.region}/sparkHistoryLogs/`,
         "--datalake-formats": "iceberg",
-        "--extra-py-files": `s3://aws-glue-studio-transforms-560373232017-prod-eu-central-1/gs_common.py,s3://aws-glue-studio-transforms-560373232017-prod-eu-central-1/gs_now.py,s3://aws-glue-studio-transforms-560373232017-prod-eu-central-1/gs_derived.py`,
+        "--extra-py-files":
+          "s3://aws-glue-studio-transforms-560373232017-prod-eu-central-1/gs_common.py,s3://aws-glue-studio-transforms-560373232017-prod-eu-central-1/gs_now.py,s3://aws-glue-studio-transforms-560373232017-prod-eu-central-1/gs_derived.py",
       },
       executionClass: "STANDARD",
       jobRunQueuingEnabled: true,
-      maintenanceWindow: "Sun:2",
     });
     billingJob.node.addDependency(deployment);
 

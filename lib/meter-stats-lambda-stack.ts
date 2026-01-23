@@ -140,9 +140,9 @@ WHERE {where_clause}
 
         # Execute the query using the Glue resource link database
         # (Athena SDK can't directly access S3 Tables catalog)
+        # Note: Removed ResultConfiguration as the workgroup manages query results
         response = athena.start_query_execution(
             QueryString=query,
-            ResultConfiguration={'OutputLocation': output_location},
             QueryExecutionContext={
                 'Database': f'{namespace}_link'
             },
