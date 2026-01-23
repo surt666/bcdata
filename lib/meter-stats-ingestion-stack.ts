@@ -230,7 +230,7 @@ def lambda_handler(event, context):
 
     # Upload to S3
     timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-    s3_key = f'meter-stats/billing_{timestamp}.csv'
+    s3_key = f'meter-stats/billing.csv'
 
     print(f"Uploading to s3://{s3_bucket}/{s3_key}")
 
