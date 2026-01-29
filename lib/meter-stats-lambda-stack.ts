@@ -3,6 +3,7 @@ import { Construct } from "constructs";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lakeformation from "aws-cdk-lib/aws-lakeformation";
+import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 
 export interface MeterStatsLambdaStackProps extends cdk.StackProps {
   tableBucketName: string;
@@ -118,20 +119,35 @@ def handler(event, context):
         # Build the Athena query
         # Note: We don't prefix the table name with the database since it's set in QueryExecutionContext
         query = f"""
-SELECT CONCAT('C#', CAST(company_id AS VARCHAR), '#P#', CAST(property_id AS VARCHAR), '#B#', CAST(building_id AS VARCHAR)) as id,
-	   building_name,
-       total,
-       actively_remote_read,
-       active_manual_read,
-       active_calculation_meters,
-       inactive_remotely_read,
-       inactive_manually_read,
-       inactive_calculation_meters,
-       unsupported_remotely_read,
-       unsupported_manually_read,
-       unsupported_calculation_meters,
-       active_management_read,
-       active_garbage_meter_read
+SELECT CONCAT('C#', CAST(company_id AS VARCHAR), '#P#', CAST(parent_id AS VARCHAR), '#B#', CAST(building_id AS VARCHAR)) as id,
+        timestamp TIMESTAMP,
+        company_id,
+        parent_id,
+        building_id,
+        building_name,
+        total,
+        actively_remote_read,
+        active_manual_read,
+        active_calculation_meters,
+        inactive_remotely_read,
+        inactive_manually_read,
+        inactive_calculation_meters,
+        unsupported_remotely_read,
+        unsupported_manually_read,
+        unsupported_calculation_meters,
+        active_management_read,
+        active_waste_remote,
+        active_waste_nonremote,
+        active_waste_calc,
+        active_waste_total,
+        inactive_waste_remote,
+        inactive_waste_nonremote,
+        inactive_waste_calc,
+        inactive_waste_total,
+        unsupported_waste_remote,
+        unsupported_waste_nonremote,
+        unsupported_waste_calc,
+        unsupported_waste_total 
 FROM {table_name}
 WHERE {where_clause}
 """
@@ -146,7 +162,7 @@ WHERE {where_clause}
             QueryExecutionContext={
                 'Database': f'{namespace}_link'
             },
-            WorkGroup='primary'
+            WorkGroup='billing-wg'
         )
 
         query_execution_id = response['QueryExecutionId']
@@ -354,13 +370,50 @@ WHERE {where_clause}
 
     // Add public function URL
     this.functionUrl = this.meterStatsQueryFn.addFunctionUrl({
-      authType: lambda.FunctionUrlAuthType.NONE,
+      authType: lambda.FunctionUrlAuthType.AWS_IAM,
       cors: {
         allowedOrigins: ["*"],
         allowedMethods: [lambda.HttpMethod.GET, lambda.HttpMethod.POST],
         allowedHeaders: ["*"],
       },
     });
+
+    // Create IAM user for invoking the Lambda function URL
+    const meterStatsApiUser = new iam.User(this, "MeterStatsApiUser", {
+      userName: "meter-stats-api-user",
+    });
+
+    // Grant the user permission to invoke the Lambda function URL
+    meterStatsApiUser.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ["lambda:InvokeFunctionUrl"],
+        resources: [this.meterStatsQueryFn.functionArn],
+      }),
+    );
+
+    // Create access key for the user
+    const accessKey = new iam.CfnAccessKey(this, "MeterStatsApiUserAccessKey", {
+      userName: meterStatsApiUser.userName,
+    });
+
+    // Store credentials in Secrets Manager
+    const apiCredentialsSecret = new secretsmanager.Secret(
+      this,
+      "MeterStatsApiCredentials",
+      {
+        secretName: "meter-stats-api-credentials",
+        description: "API credentials for meter stats Lambda function URL",
+        secretObjectValue: {
+          accessKeyId: cdk.SecretValue.unsafePlainText(accessKey.ref),
+          secretAccessKey: cdk.SecretValue.resourceAttribute(
+            accessKey.attrSecretAccessKey,
+          ),
+          functionUrl: cdk.SecretValue.unsafePlainText(this.functionUrl.url),
+          region: cdk.SecretValue.unsafePlainText(cdk.Aws.REGION),
+        },
+      },
+    );
 
     // Output the Lambda function details
     new cdk.CfnOutput(this, "MeterStatsQueryFunctionArn", {
@@ -379,6 +432,17 @@ WHERE {where_clause}
       value: this.functionUrl.url,
       description: "Public URL for the meter statistics query Lambda function",
       exportName: `${this.stackName}-MeterStatsQueryFunctionUrl`,
+    });
+
+    new cdk.CfnOutput(this, "MeterStatsApiCredentialsSecretArn", {
+      value: apiCredentialsSecret.secretArn,
+      description: "ARN of the secret containing API credentials",
+      exportName: `${this.stackName}-ApiCredentialsSecretArn`,
+    });
+
+    new cdk.CfnOutput(this, "MeterStatsApiUserName", {
+      value: meterStatsApiUser.userName,
+      description: "IAM user name for API access",
     });
   }
 }

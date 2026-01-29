@@ -5,7 +5,7 @@ import { MeterStatsLambdaStack } from "../lib/meter-stats-lambda-stack";
 import { MeterStatsIngestionStack } from "../lib/meter-stats-ingestion-stack";
 
 const app = new cdk.App();
-new BcdataStack(app, "BcDataStack1", {
+new BcdataStack(app, "BcDataStack2", {
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
     region: process.env.CDK_DEFAULT_REGION,
@@ -14,7 +14,7 @@ new BcdataStack(app, "BcDataStack1", {
 
 // Standalone stack for Lambda function experimentation
 new MeterStatsLambdaStack(app, "MeterStatsLambdaStack", {
-  tableBucketName: "billing",
+  tableBucketName: "billing5",
   namespace: "billingdata",
   tableName: "meters",
   env: {

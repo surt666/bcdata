@@ -1,7 +1,6 @@
 import * as cdk from "aws-cdk-lib/core";
 import { Construct } from "constructs";
 import { aws_s3tables as s3tables } from "aws-cdk-lib";
-import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as cr from "aws-cdk-lib/custom-resources";
 import * as lakeformation from "aws-cdk-lib/aws-lakeformation";
@@ -10,21 +9,41 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3Deployment from "aws-cdk-lib/aws-s3-deployment";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as ssm from "aws-cdk-lib/aws-ssm";
-
-// import * as sqs from 'aws-cdk-lib/aws-sqs';
+import * as athena from "aws-cdk-lib/aws-athena";
+import * as crypto from "crypto";
 
 export class BcdataStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    const tableBucket = "billing10";
-    const namespace_name = "billingdata6";
+    const tableBucket = "billing12";
+    const namespace_name = "billingdata8";
+    const table_name = "meters";
+
+    // Change this version to force re-running the billing-table-job
+    const tableJobVersion = "2";
 
     // S3 bucket for Athena query results
     const athenaResultsBucket = new s3.Bucket(this, "AthenaResultsBucket", {
-      bucketName: `${tableBucket}-athena-results`,
+      bucketName: `${tableBucket}-athena-billing-results`,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
+    });
+
+    const daq_workgroup = new athena.CfnWorkGroup(this, "AthenaWorkgroup", {
+      name: "billing-wg",
+      workGroupConfiguration: {
+        bytesScannedCutoffPerQuery: undefined, // or null, if TypeScript complains about undefined
+        enforceWorkGroupConfiguration: false,
+        publishCloudWatchMetricsEnabled: false,
+        requesterPaysEnabled: false,
+        resultConfiguration: {
+          encryptionConfiguration: {
+            encryptionOption: "SSE_S3",
+          },
+          outputLocation: `s3://${athenaResultsBucket.bucketName}/query`,
+        },
+      },
     });
 
     // S3 bucket for meter stats CSV files from ingestion
@@ -32,7 +51,7 @@ export class BcdataStack extends cdk.Stack {
       this,
       "MeterStatsIngestionBucket",
       {
-        bucketName: `billing-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
+        bucketName: `${namespace_name}-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
         versioned: false,
         removalPolicy: cdk.RemovalPolicy.DESTROY,
         autoDeleteObjects: false,
@@ -139,24 +158,18 @@ export class BcdataStack extends cdk.Stack {
     });
     resourceLink.node.addDependency(namespace);
 
-    const configureTableFnRole = new iam.Role(this, "LambdaRole", {
-      assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+    const configureTableFnRole = new iam.Role(this, "BillingGlueRole", {
+      assumedBy: new iam.ServicePrincipal("glue.amazonaws.com"),
       managedPolicies: [
         iam.ManagedPolicy.fromAwsManagedPolicyName(
-          "service-role/AWSLambdaBasicExecutionRole",
+          "service-role/AWSGlueServiceRole",
         ),
       ],
     });
-    // Grant permissions to Lambda
+    // Grant permissions
     configureTableFnRole.addToPolicy(
       new iam.PolicyStatement({
-        actions: [
-          "athena:StartQueryExecution",
-          "athena:GetQueryExecution",
-          "athena:GetQueryResults",
-          "glue:GetDataCatalog",
-          "glue:CreateTable",
-        ],
+        actions: ["glue:GetDataCatalog", "glue:CreateTable"],
         resources: ["*"],
       }),
     );
@@ -212,9 +225,9 @@ export class BcdataStack extends cdk.Stack {
     );
 
     // Grant Lake Formation permissions on the resource link database
-    const lambdaResourceLinkDbPermissions = new lakeformation.CfnPermissions(
+    const glueResourceLinkDbPermissions = new lakeformation.CfnPermissions(
       this,
-      "LambdaResourceLinkDbPermissions",
+      "glueResourceLinkDbPermissions",
       {
         dataLakePrincipal: {
           dataLakePrincipalIdentifier: configureTableFnRole.roleArn,
@@ -228,13 +241,13 @@ export class BcdataStack extends cdk.Stack {
         permissions: ["ALL"],
       },
     );
-    lambdaResourceLinkDbPermissions.node.addDependency(resourceLink);
-    lambdaResourceLinkDbPermissions.node.addDependency(namespace);
+    glueResourceLinkDbPermissions.node.addDependency(resourceLink);
+    glueResourceLinkDbPermissions.node.addDependency(namespace);
 
     // Grant Lake Formation permissions on resource link tables
-    const lambdaResourceLinkTablePermissions = new lakeformation.CfnPermissions(
+    const glueResourceLinkTablePermissions = new lakeformation.CfnPermissions(
       this,
-      "LambdaResourceLinkTablePermissions",
+      "glueResourceLinkTablePermissions",
       {
         dataLakePrincipal: {
           dataLakePrincipalIdentifier: configureTableFnRole.roleArn,
@@ -249,13 +262,13 @@ export class BcdataStack extends cdk.Stack {
         permissions: ["SELECT", "INSERT", "DELETE", "DESCRIBE", "ALTER"],
       },
     );
-    lambdaResourceLinkTablePermissions.node.addDependency(resourceLink);
-    lambdaResourceLinkTablePermissions.node.addDependency(namespace);
+    glueResourceLinkTablePermissions.node.addDependency(resourceLink);
+    glueResourceLinkTablePermissions.node.addDependency(namespace);
 
     // Grant Lake Formation permissions on actual S3 Tables database
-    const lambdaS3TablesDbPermissions = new lakeformation.CfnPermissions(
+    const glueS3TablesDbPermissions = new lakeformation.CfnPermissions(
       this,
-      "LambdaS3TablesDbPermissions",
+      "glueS3TablesDbPermissions",
       {
         dataLakePrincipal: {
           dataLakePrincipalIdentifier: configureTableFnRole.roleArn,
@@ -269,12 +282,12 @@ export class BcdataStack extends cdk.Stack {
         permissions: ["ALL"],
       },
     );
-    lambdaS3TablesDbPermissions.node.addDependency(namespace);
+    glueS3TablesDbPermissions.node.addDependency(namespace);
 
     // Grant Lake Formation permissions on actual S3 Tables
-    const lambdaS3TablesTablePermissions = new lakeformation.CfnPermissions(
+    const glueS3TablesTablePermissions = new lakeformation.CfnPermissions(
       this,
-      "LambdaS3TablesTablePermissions",
+      "glueS3TablesTablePermissions",
       {
         dataLakePrincipal: {
           dataLakePrincipalIdentifier: configureTableFnRole.roleArn,
@@ -289,7 +302,7 @@ export class BcdataStack extends cdk.Stack {
         permissions: ["SELECT", "INSERT", "DELETE", "DESCRIBE", "ALTER"],
       },
     );
-    lambdaS3TablesTablePermissions.node.addDependency(namespace);
+    glueS3TablesTablePermissions.node.addDependency(namespace);
 
     // const metersTable = new s3tables.CfnTable(this, "meterstable", {
     //   namespace: namespace.namespace,
@@ -403,215 +416,171 @@ export class BcdataStack extends cdk.Stack {
     // });
     // metersTable.addDependency(namespace);
 
-    // Lambda function to configure partitioning and sort order
-    const configureTableFn = new lambda.Function(
-      this,
-      "ConfigureTableFunction",
-      {
-        runtime: lambda.Runtime.PYTHON_3_12,
-        handler: "index.handler",
-        timeout: cdk.Duration.minutes(5),
-        role: configureTableFnRole,
-        code: lambda.Code.fromInline(`
-import json
+    const billing_table_script = `
 import boto3
-import time
-import cfnresponse
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import year, month, dayofmonth, from_unixtime, col
 
-# athena = boto3.client('athena')
-s3_tables = boto3.client('s3tables')
-glue_client = boto3.client('glue')
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init("IcebergGlueLoaderCreateAndWrite", {})
 
-def handler(event, context):
-    try:
-        print(f"Event: {json.dumps(event)}")
+# S3Tables Iceberg configuration
 
-        request_type = event['RequestType']
-        if request_type == 'Delete':
-            cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-            return
+spark.conf.set("spark.sql.defaultCatalog","s3tables") 
+spark.conf.set("spark.sql.catalog.s3tables", "org.apache.iceberg.spark.SparkCatalog") 
+spark.conf.set("spark.sql.catalog.s3tables.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") 
+spark.conf.set("spark.sql.catalog.s3tables.glue.id", "891377204778:s3tablescatalog/${s3TableBucket.tableBucketName}") 
+spark.conf.set("spark.sql.catalog.s3tables.warehouse", "s3://${s3TableBucket.tableBucketName}/warehouse/") 
 
-        # Get properties from event
-        props = event['ResourceProperties']
-        namespace = props['Namespace']
-        table_name = props['TableName']
-#        table_bucket_arn = props['TableBucketArn']
-        table_bucket_name = props['TableBucketName']
-#        output_location = props['OutputLocation']
+#variables
+catalog_name = "s3tables"
+name_space = "${namespace_name}"
+table_name = "${table_name}"
 
-        # Only configure on Create and Update
-        if request_type in ['Create', 'Update']:
-            query_execution_ids = []
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS {name_space}.{table_name} (
+        timestamp TIMESTAMP,
+        company_id INT,
+        parent_id INT,
+        building_id INT,
+        building_name STRING,
+        total INT,
+        actively_remote_read INT,
+        active_manual_read INT,
+        active_calculation_meters INT,
+        inactive_remotely_read INT,
+        inactive_manually_read INT,
+        inactive_calculation_meters INT,
+        unsupported_remotely_read INT,
+        unsupported_manually_read INT,
+        unsupported_calculation_meters INT,
+        active_management_read INT,
+        active_waste_remote INT,
+        active_waste_nonremote INT,
+        active_waste_calc INT,
+        active_waste_total INT,
+        inactive_waste_remote INT,
+        inactive_waste_nonremote INT,
+        inactive_waste_calc INT,
+        inactive_waste_total INT,
+        unsupported_waste_remote INT,
+        unsupported_waste_nonremote INT,
+        unsupported_waste_calc INT,
+        unsupported_waste_total INT 
+    )
+    USING iceberg
+    PARTITIONED BY (months(timestamp), bucket(4, company_id), bucket(4, parent_id), bucket(4, building_id) )
+    TBLPROPERTIES (
+        'write.metadata.delete-after-commit.enabled'='true',
+        'write.metadata.previous-versions-max'='10',
+        'write.format.default' = 'parquet',
+        'write.parquet.compression-codec' = 'zstd',
+        'write.order-by' = 'timestamp, company_id, parent_id, building_id',
+        'format-version' = '2'
+    );
+""")`;
 
-            # Create table in S3 Tables catalog
-#             query = f"""CREATE TABLE IF NOT EXISTS {table_name} (
-#   timestamp timestamp,
-#   company_id int,
-#   parent_id int,
-#   building_id int,
-#   building_name string,
-#   total int,
-#   actively_remote_read int,
-#   active_manual_read int,
-#   active_calculation_meters int,
-#   inactive_remotely_read int,
-#   inactive_manually_read int,
-#   inactive_calculation_meters int,
-#   unsupported_remotely_read int,
-#   unsupported_manually_read int,
-#   unsupported_calculation_meters int,
-#   active_management_read int,
-#   active_waste_remote int, 
-#   active_waste_nonremote int, 
-#   active_waste_calc int, 
-#   active_waste_total int, 
-#   inactive_waste_remote int, 
-#   inactive_waste_nonremote int, 
-#   inactive_waste_calc int, 
-#   inactive_waste_total int, 
-#   unsupported_waste_remote int, 
-#   unsupported_waste_nonremote int, 
-#   unsupported_waste_calc int, 
-#   unsupported_waste_total int Y)
-# PARTITIONED BY (month(timestamp), bucket(4, company_id), bucket(4, parent_id), bucket(4, building_id))
-# TBLPROPERTIES (
-#   'table_type'='iceberg',
-# )"""
-            table_input = {
-                "Name": table_name,
-                "StorageDescriptor": {
-                    "Columns": [
-                        {"Name": "timestamp", "Type": "timestamp"},
-                        {"Name": "company_id", "Type": "int"},
-                        {"Name": "parent_id", "Type": "int"},
-                        {"Name": "building_id", "Type": "int"},
-                        {"Name": "building_name", "Type": "string"},
-                        {"Name": "total", "Type": "int"},
-                        {"Name": "actively_remote_read", "Type": "int"},
-                        {"Name": "active_manual_read", "Type": "int"},
-                        {"Name": "active_calculation_meters", "Type": "int"},
-                        {"Name": "inactive_remotely_read", "Type": "int"},
-                        {"Name": "inactive_manually_read", "Type": "int"},
-                        {"Name": "inactive_calculation_meters", "Type": "int"},
-                        {"Name": "unsupported_remotely_read", "Type": "int"},
-                        {"Name": "unsupported_manually_read", "Type": "int"},
-                        {"Name": "unsupported_calculation_meters", "Type": "int"},
-                        {"Name": "active_management_read", "Type": "int"},
-                        {"Name": "active_waste_remote", "Type": "int"},
-                        {"Name": "active_waste_nonremote", "Type": "int"},
-                        {"Name": "active_waste_calc", "Type": "int"},
-                        {"Name": "active_waste_total", "Type": "int"},
-                        {"Name": "inactive_waste_remote", "Type": "int"},
-                        {"Name": "inactive_waste_nonremote", "Type": "int"},
-                        {"Name": "inactive_waste_calc", "Type": "int"},
-                        {"Name": "inactive_waste_total", "Type": "int"},
-                        {"Name": "unsupported_waste_remote", "Type": "int"},
-                        {"Name": "unsupported_waste_nonremote", "Type": "int"},
-                        {"Name": "unsupported_waste_calc", "Type": "int"},
-                        {"Name": "unsupported_waste_total", "Type": "int"}
-                    ]
-                },
-                "TableType": "EXTERNAL_TABLE",
-                "Parameters": {
-                    "table_type": "ICEBERG",
-                    "format": "ICEBERG"
-                },
-                "PartitionKeys": [
-                    {
-                        "Name": "timestamp",
-                        "Type": "timestamp"
-                    },
-                    {
-                        "Name": "company_id",
-                        "Type": "int"
-                    },
-                    {
-                        "Name": "parent_id",
-                        "Type": "int"
-                    },
-                    {
-                        "Name": "building_id",
-                        "Type": "int"
-                    },
-                ]  
-            }
-
-            try:
-                response = glue_client.create_table(
-                    CatalogId=f's3tablescatalog/{table_bucket_name}',
-                    DatabaseName=namespace,
-                    TableInput=table_input
-                )
-                print("Table created successfully!")
-                print(json.dumps(response, indent=2, default=str))
-            except Exception as e:
-                print(f"Error creating table: {str(e)}")
-            # response = athena.start_query_execution(
-            #     QueryString=query,
-            #     QueryExecutionContext={
-            #         'Catalog': f's3tablescatalog/{table_bucket_name}',
-            #         'Database': namespace
-            #     },
-            #     WorkGroup='billing'
-            # )
-            # query_execution_ids.append(response['QueryExecutionId'])
-
-            # # Wait for all queries to complete
-            # for query_id in query_execution_ids:
-            #     while True:
-            #         response = athena.get_query_execution(QueryExecutionId=query_id)
-            #         status = response['QueryExecution']['Status']['State']
-
-            #         if status in ['SUCCEEDED']:
-            #             print(f"Query {query_id} succeeded")
-            #             break
-            #         elif status in ['FAILED', 'CANCELLED']:
-            #             reason = response['QueryExecution']['Status'].get('StateChangeReason', 'Unknown')
-            #             raise Exception(f"Query {query_id} failed: {reason}")
-
-            #         time.sleep(2)
-
-        cfnresponse.send(event, context, cfnresponse.SUCCESS, {
-            'Message': 'Table configured successfully'
-        })
-
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        cfnresponse.send(event, context, cfnresponse.FAILED, {
-            'Error': str(e)
-        })
-`),
-      },
+    const scriptBucket = s3.Bucket.fromBucketName(
+      this,
+      "GlueAssetsBucket",
+      `aws-glue-assets-${this.account}-${this.region}`,
     );
 
-    // Create custom resource provider
-    const provider = new cr.Provider(this, "ConfigureTableProvider", {
-      onEventHandler: configureTableFn,
+    // Generate hash of script content to force updates when script changes
+    const tableScriptHash = crypto
+      .createHash("md5")
+      .update(billing_table_script)
+      .digest("hex")
+      .substring(0, 8);
+
+    const bucketDeployment = new s3Deployment.BucketDeployment(
+      this,
+      `DeployTableScript${tableScriptHash}`,
+      {
+        sources: [
+          s3Deployment.Source.data(
+            `billing_table_job-${tableScriptHash}.py`,
+            billing_table_script,
+          ),
+        ],
+        destinationBucket: scriptBucket,
+        destinationKeyPrefix: "glue-scripts/",
+        prune: false,
+      },
+    );
+    bucketDeployment.node.addDependency(scriptBucket);
+
+    const tableScriptLocation = `s3://${scriptBucket.bucketName}/glue-scripts/billing_table_job-${tableScriptHash}.py`;
+
+    const tableJob = new glue.CfnJob(this, "BillingTableJob", {
+      name: "billing-table-job",
+      role: configureTableFnRole.roleArn,
+      command: {
+        name: "glueetl",
+        pythonVersion: "3",
+        scriptLocation: tableScriptLocation,
+      },
+      glueVersion: "5.0",
+      workerType: "G.1X",
+      numberOfWorkers: 2,
+      executionProperty: {
+        maxConcurrentRuns: 1,
+      },
+      defaultArguments: {
+        "--enable-metrics": "true",
+        "--enable-spark-ui": "false",
+        "--enable-job-insights": "true",
+        "--enable-continuous-cloudwatch-log": "true",
+        "--enable-glue-datacatalog": "true",
+        "--job-language": "python",
+        "--enable-auto-scaling": "false",
+        "--TempDir": `s3://aws-glue-assets-${this.account}-${this.region}/temporary/`,
+        "--spark-event-logs-path": `s3://aws-glue-assets-${this.account}-${this.region}/sparkHistoryLogs/`,
+        "--conf": `spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions`,
+      },
+      executionClass: "STANDARD",
+      jobRunQueuingEnabled: true,
+    });
+    tableJob.node.addDependency(s3TableBucket);
+
+    const tableJobArn = this.formatArn({
+      service: "glue",
+      resource: "job",
+      resourceName: tableJob.name,
     });
 
-    const tablename = "billing_meters2";
-    // Create custom resource
-    const configureTableResource = new cdk.CustomResource(
-      this,
-      "ConfigureTableResource",
-      {
-        serviceToken: provider.serviceToken,
-        properties: {
-          Namespace: namespace.namespace,
-          TableName: tablename,
-          // TableBucketArn: s3TableBucket.attrTableBucketArn,
-          TableBucketName: tableBucket,
-          // OutputLocation: `s3://${tableBucket}-athena-results/`,
-          // Force update by changing this version when needed
-          Version: "26",
+    const startJob = new cr.AwsCustomResource(this, "StartTableJob", {
+      onCreate: {
+        service: "Glue",
+        action: "startJobRun",
+        parameters: {
+          JobName: tableJob.name,
         },
+        physicalResourceId: cr.PhysicalResourceId.of(
+          `TableJobStarter-${tableJobVersion}`,
+        ),
       },
-    );
-
-    configureTableResource.node.addDependency(namespace);
-    configureTableResource.node.addDependency(athenaResultsBucket);
-    configureTableResource.node.addDependency(configureTableFn);
-    configureTableResource.node.addDependency(resourceLink);
+      onUpdate: {
+        service: "Glue",
+        action: "startJobRun",
+        parameters: {
+          JobName: tableJob.name,
+        },
+        physicalResourceId: cr.PhysicalResourceId.of(
+          `TableJobStarter-${tableJobVersion}`,
+        ),
+      },
+      policy: cr.AwsCustomResourcePolicy.fromSdkCalls({
+        resources: [tableJobArn],
+      }),
+    });
+    startJob.node.addDependency(tableJob);
+    startJob.node.addDependency(bucketDeployment);
 
     // Table bucket policy to control access
     new s3tables.CfnTableBucketPolicy(this, "BillingTableBucketPolicy", {
@@ -638,13 +607,7 @@ def handler(event, context):
       tableBucketArn: s3TableBucket.attrTableBucketArn,
     });
 
-    const scriptBucket = s3.Bucket.fromBucketName(
-      this,
-      "GlueAssetsBucket",
-      `aws-glue-assets-${this.account}-${this.region}`,
-    );
-
-    const script = `
+    const billing_script = `
 import sys
 from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
@@ -684,19 +647,35 @@ ChangeSchema_node1769415812360 = ApplyMapping.apply(frame=ActiveManagement_node1
 
 # Script generated for node AWS Glue Data Catalog
 AWSGlueDataCatalog_node1768987880200_df = ChangeSchema_node1769415812360.toDF()
-AWSGlueDataCatalog_node1768987880200 = glueContext.write_data_frame.from_catalog(frame=AWSGlueDataCatalog_node1768987880200_df, database="${namespace_name}_link", table_name="${tablename}", additional_options={})
+AWSGlueDataCatalog_node1768987880200 = glueContext.write_data_frame.from_catalog(frame=AWSGlueDataCatalog_node1768987880200_df, database="${namespace_name}_link", table_name="${table_name}", additional_options={})
 
 job.commit()`;
 
-    const deployment = new s3Deployment.BucketDeployment(this, "DeployScript", {
-      sources: [s3Deployment.Source.data("glue_billing_job.py", script)],
-      destinationBucket: scriptBucket,
-      destinationKeyPrefix: "glue-scripts/",
-      prune: false,
-    });
+    // Generate hash of billing script content to force updates when script changes
+    const billingScriptHash = crypto
+      .createHash("md5")
+      .update(billing_script)
+      .digest("hex")
+      .substring(0, 8);
+
+    const deployment = new s3Deployment.BucketDeployment(
+      this,
+      `DeployBillingScript${billingScriptHash}`,
+      {
+        sources: [
+          s3Deployment.Source.data(
+            `glue_billing_job-${billingScriptHash}.py`,
+            billing_script,
+          ),
+        ],
+        destinationBucket: scriptBucket,
+        destinationKeyPrefix: "glue-scripts/",
+        prune: false,
+      },
+    );
 
     // Reference the uploaded script
-    const scriptLocation = `s3://${scriptBucket.bucketName}/glue-scripts/glue_billing_job.py`;
+    const scriptLocation = `s3://${scriptBucket.bucketName}/glue-scripts/glue_billing_job-${billingScriptHash}.py`;
 
     // Create IAM role for Glue job
     const glueJobRole = new iam.Role(this, "GlueJobRole", {
@@ -783,86 +762,6 @@ job.commit()`;
       }),
     );
 
-    // Grant Lake Formation permissions on resource link database
-    const glueResourceLinkDbPermissions = new lakeformation.CfnPermissions(
-      this,
-      "GlueResourceLinkDbPermissions",
-      {
-        dataLakePrincipal: {
-          dataLakePrincipalIdentifier: glueJobRole.roleArn,
-        },
-        resource: {
-          databaseResource: {
-            name: `${namespace_name}_link`,
-            catalogId: cdk.Aws.ACCOUNT_ID,
-          },
-        },
-        permissions: ["ALL"],
-      },
-    );
-    glueResourceLinkDbPermissions.node.addDependency(resourceLink);
-    glueResourceLinkDbPermissions.node.addDependency(namespace);
-
-    // Grant Lake Formation permissions on resource link tables
-    const glueResourceLinkTablePermissions = new lakeformation.CfnPermissions(
-      this,
-      "GlueResourceLinkTablePermissions",
-      {
-        dataLakePrincipal: {
-          dataLakePrincipalIdentifier: glueJobRole.roleArn,
-        },
-        resource: {
-          tableResource: {
-            databaseName: `${namespace_name}_link`,
-            catalogId: cdk.Aws.ACCOUNT_ID,
-            tableWildcard: {},
-          },
-        },
-        permissions: ["SELECT", "INSERT", "DELETE", "DESCRIBE", "ALTER"],
-      },
-    );
-    glueResourceLinkTablePermissions.node.addDependency(resourceLink);
-    glueResourceLinkTablePermissions.node.addDependency(namespace);
-
-    // Grant Lake Formation permissions on actual S3 Tables database
-    const glueS3TablesDbPermissions = new lakeformation.CfnPermissions(
-      this,
-      "GlueS3TablesDbPermissions",
-      {
-        dataLakePrincipal: {
-          dataLakePrincipalIdentifier: glueJobRole.roleArn,
-        },
-        resource: {
-          databaseResource: {
-            name: namespace_name,
-            catalogId: `${cdk.Aws.ACCOUNT_ID}:s3tablescatalog/${tableBucket}`,
-          },
-        },
-        permissions: ["ALL"],
-      },
-    );
-    glueS3TablesDbPermissions.node.addDependency(namespace);
-
-    // Grant Lake Formation permissions on actual S3 Tables
-    const glueS3TablesTablePermissions = new lakeformation.CfnPermissions(
-      this,
-      "GlueS3TablesTablePermissions",
-      {
-        dataLakePrincipal: {
-          dataLakePrincipalIdentifier: glueJobRole.roleArn,
-        },
-        resource: {
-          tableResource: {
-            databaseName: namespace_name,
-            catalogId: `${cdk.Aws.ACCOUNT_ID}:s3tablescatalog/${tableBucket}`,
-            tableWildcard: {},
-          },
-        },
-        permissions: ["SELECT", "INSERT", "DELETE", "DESCRIBE", "ALTER"],
-      },
-    );
-    glueS3TablesTablePermissions.node.addDependency(namespace);
-
     // Create the Glue Job
     const billingJob = new glue.CfnJob(this, "DaqBillingJob", {
       name: "billing-job",
@@ -903,6 +802,22 @@ job.commit()`;
       jobRunQueuingEnabled: true,
     });
     billingJob.node.addDependency(deployment);
+
+    // Create Glue trigger to run job daily at 01:00 Danish time (UTC+1/+2)
+    // Danish time is UTC+1 in winter (standard time) and UTC+2 in summer (DST)
+    // 01:00 Copenhagen = 00:00 UTC (winter) or 23:00 UTC (summer)
+    // Using 00:00 UTC as approximation (will be 01:00 CET or 02:00 CEST)
+    new glue.CfnTrigger(this, "BillingJobTrigger", {
+      name: "billing-job-daily-trigger",
+      type: "SCHEDULED",
+      schedule: "cron(0 0 * * ? *)", // Run at 00:00 UTC daily (01:00 CET / 02:00 CEST)
+      startOnCreation: true,
+      actions: [
+        {
+          jobName: billingJob.name,
+        },
+      ],
+    });
 
     const jobName = billingJob.name || billingJob.node.id;
 
